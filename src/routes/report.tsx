@@ -8,7 +8,6 @@ import {
   FileText,
   Loader2,
   MapPinned,
-  XCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
@@ -23,6 +22,8 @@ import { pointsAlongTrench, trenchLength } from "@/lib/geo";
 import { loadProjectData, type ProjectData, type ProjectTrench } from "@/lib/project-data";
 import { loadSiteData } from "@/lib/site-data";
 import { siteDataToProjectData } from "@/lib/site-adapter";
+import { friendlyIssueLabel } from "@/lib/issue-labels";
+import { METERS_PER_PHOTO } from "@/lib/validate-photo.functions";
 
 export const Route = createFileRoute("/report")({
   validateSearch: (raw: Record<string, unknown>) => ({
@@ -73,7 +74,27 @@ type SegmentRow = {
 
 const PROJECT_NAME = "CLP20417A · Maria Rain fiber route";
 const LOT_ID = "Demo lot · GIS bundle public/site";
-const MAX_TABLE_ROWS = 10;
+type ZoneSummaryRow = {
+  fcpId: string;
+  label: string;
+  status: TrenchStatus;
+  lengthM: number;
+  trenchCount: number;
+  greenTrenches: number;
+  yellowTrenches: number;
+  redTrenches: number;
+  photoCount: number;
+  compliantPhotos: number;
+  needsReviewPhotos: number;
+  nonCompliantPhotos: number;
+  pendingPhotos: number;
+  greenPct: number;
+  yellowPct: number;
+  redPct: number;
+  topIssues: { issue: string; count: number }[];
+};
+
+type IssueAggregate = { issue: string; count: number; severity: "error" | "warning" | "info" };
 
 function ReportPage() {
   const { project } = Route.useSearch();
@@ -144,13 +165,31 @@ function ReportPage() {
     [site, coverage, photos],
   );
 
+  const compliantSegments = segmentRows.filter((row) => row.status === "green");
   const failedSegments = segmentRows.filter(
-    (row) => row.status === "yellow" || row.flaggedPhotos > 0,
+    (row) => row.status === "yellow" || (row.status !== "green" && row.flaggedPhotos > 0),
   );
   const missingSegments = segmentRows.filter((row) => row.status === "red");
-  const actionRows = segmentRows.filter((row) => row.status !== "green").slice(0, MAX_TABLE_ROWS);
   const totalLengthM = coverage?.totals.totalM ?? 0;
   const photoSummary = summarizePhotos(photos);
+  const zoneSummary = useMemo(
+    () => (site && coverage ? buildZoneSummary(site, coverage, photos) : []),
+    [site, coverage, photos],
+  );
+  const greenZones = zoneSummary.filter((z) => z.status === "green").length;
+  const yellowZones = zoneSummary.filter((z) => z.status === "yellow").length;
+  const redZones = zoneSummary.filter((z) => z.status === "red").length;
+  const issueRanking = useMemo(() => aggregateIssues(photos).slice(0, 10), [photos]);
+  const photoDateRange = useMemo(() => {
+    let min: string | null = null;
+    let max: string | null = null;
+    for (const p of photos) {
+      if (!p.captured_at) continue;
+      if (!min || p.captured_at < min) min = p.captured_at;
+      if (!max || p.captured_at > max) max = p.captured_at;
+    }
+    return { min, max };
+  }, [photos]);
 
   async function exportPdf() {
     if (!reportRef.current || !site) return;
@@ -192,13 +231,12 @@ function ReportPage() {
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="px-4 py-3 border-b border-border flex items-center justify-between sticky top-0 bg-background z-20">
-        <Link
-          to="/dashboard"
-          search={{ fcp: undefined, trench: undefined, waypoint: undefined }}
+        <a
+          href={project ? `/project/${project}` : "/projects"}
           className="flex items-center gap-1.5 text-sm hover:text-primary"
         >
-          <ArrowLeft className="w-4 h-4" /> Dashboard
-        </Link>
+          <ArrowLeft className="w-4 h-4" /> {project ? "Project map" : "Projects"}
+        </a>
         <div className="flex items-center gap-2">
           <Link
             to="/import"
@@ -245,6 +283,18 @@ function ReportPage() {
                 <span className="font-semibold text-slate-900">Generated:</span>{" "}
                 {generatedAt.toLocaleString()}
               </div>
+              {(photoDateRange.min || photoDateRange.max) && (
+                <div>
+                  <span className="font-semibold text-slate-900">Evidence dated:</span>{" "}
+                  {photoDateRange.min
+                    ? new Date(photoDateRange.min).toLocaleDateString()
+                    : "—"}
+                  {" → "}
+                  {photoDateRange.max
+                    ? new Date(photoDateRange.max).toLocaleDateString()
+                    : "—"}
+                </div>
+              )}
             </div>
           </section>
 
@@ -304,100 +354,89 @@ function ReportPage() {
             </div>
           </section>
 
-          <section className="rounded-lg border border-slate-200 p-4">
-            <div className="flex items-center gap-2 mb-3">
+          <section className="rounded-lg border border-slate-200 p-4 space-y-3">
+            <div className="flex items-center gap-2">
               <FileText className="w-4 h-4 text-slate-600" />
-              <h2 className="text-sm font-bold uppercase tracking-wide">Executive Finding</h2>
+              <h2 className="text-sm font-bold uppercase tracking-wide">Executive Summary</h2>
             </div>
             <p className="text-sm leading-6 text-slate-700">
-              The route is currently classified as{" "}
-              <strong>{coverage.totals.greenPct.toFixed(1)}% complete</strong>,{" "}
-              <strong>{coverage.totals.yellowPct.toFixed(1)}% partial</strong>, and{" "}
-              <strong>{coverage.totals.redPct.toFixed(1)}% missing</strong> by trench length.
+              {projectName} covers <strong>{(totalLengthM / 1000).toFixed(2)} km</strong> of fiber
+              trenches across <strong>{site.fcps.length}</strong> FCP zone(s) and{" "}
+              <strong>{site.trenches.length.toLocaleString()}</strong> segments. By trench length
+              this is currently <strong>{coverage.totals.greenPct.toFixed(1)}% compliant</strong>,{" "}
+              <strong>{coverage.totals.yellowPct.toFixed(1)}% needs review</strong>, and{" "}
+              <strong>{coverage.totals.redPct.toFixed(1)}% non-compliant or undocumented</strong>.
+            </p>
+            <div className="grid sm:grid-cols-2 gap-3 text-xs">
+              <div className="rounded-md bg-slate-50 border border-slate-200 p-3 space-y-1">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
+                  Zone health
+                </div>
+                <div className="flex items-baseline gap-3">
+                  <span className="text-emerald-700 font-bold">{greenZones} compliant</span>
+                  <span className="text-amber-700 font-bold">{yellowZones} review</span>
+                  <span className="text-red-700 font-bold">{redZones} non-compliant</span>
+                </div>
+                <div className="text-slate-600">
+                  {greenZones} of {zoneSummary.length} zones are fully covered by accepted evidence.
+                </div>
+              </div>
+              <div className="rounded-md bg-slate-50 border border-slate-200 p-3 space-y-1">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
+                  Segment health
+                </div>
+                <div className="flex items-baseline gap-3">
+                  <span className="text-emerald-700 font-bold">{compliantSegments.length} ok</span>
+                  <span className="text-amber-700 font-bold">{failedSegments.length} review</span>
+                  <span className="text-red-700 font-bold">{missingSegments.length} missing</span>
+                </div>
+                <div className="text-slate-600">
+                  {photos.length.toLocaleString()} photos analyzed —{" "}
+                  {photoSummary.compliant} compliant, {photoSummary.needsReview} needs review,{" "}
+                  {photoSummary.nonCompliant} non-compliant.
+                </div>
+              </div>
+            </div>
+            <p className="text-sm leading-6 text-slate-700">
               {missingSegments.length > 0
-                ? ` ${missingSegments.length.toLocaleString()} trench segments require photo evidence before acceptance.`
-                : " No missing-evidence segments remain in the current dataset."}
+                ? `${missingSegments.length.toLocaleString()} segment(s) still require photo evidence before acceptance.`
+                : "No missing-evidence segments remain in the current dataset."}{" "}
               {failedSegments.length > 0
-                ? ` ${failedSegments.length.toLocaleString()} segment(s) have poor-quality or failed evidence that should be retaken.`
-                : " No poor-quality photo segments are currently identified."}
+                ? `${failedSegments.length.toLocaleString()} segment(s) have poor-quality or flagged evidence that should be retaken.`
+                : "No poor-quality photo segments are currently identified."}{" "}
+              {compliantSegments.length > 0 &&
+                `${compliantSegments.length.toLocaleString()} segment(s) are already fully accepted and need no further action.`}
             </p>
           </section>
 
-          <section className="grid lg:grid-cols-2 gap-5">
-            <DeficiencyTable
-              title="Failed / Poor-Quality Segments"
-              empty="No poor-quality segments detected yet. Current unverified work is listed under missing evidence."
-              rows={failedSegments.slice(0, MAX_TABLE_ROWS)}
-              icon={<AlertTriangle className="w-4 h-4 text-amber-600" />}
-            />
-            <DeficiencyTable
-              title="Missing Evidence"
-              empty="No missing-evidence segments detected."
-              rows={missingSegments.slice(0, MAX_TABLE_ROWS)}
-              icon={<XCircle className="w-4 h-4 text-red-600" />}
-            />
-          </section>
+          <ZoneBreakdownTable rows={zoneSummary} />
 
-          <section className="rounded-lg border border-slate-200 overflow-hidden">
-            <div className="px-4 py-3 border-b border-slate-200 flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-700" />
-              <h2 className="text-sm font-bold uppercase tracking-wide">Contractor Action List</h2>
-            </div>
-            {actionRows.length === 0 ? (
-              <div className="p-4 text-sm text-slate-500">No contractor actions remain open.</div>
-            ) : (
-              <table className="w-full text-xs">
-                <thead className="bg-slate-50 text-slate-500 uppercase tracking-wide">
-                  <tr>
-                    <th className="text-left font-semibold px-3 py-2">Priority</th>
-                    <th className="text-left font-semibold px-3 py-2">FCP / Segment</th>
-                    <th className="text-left font-semibold px-3 py-2">Issue</th>
-                    <th className="text-left font-semibold px-3 py-2">
-                      Required contractor action
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {actionRows.map((row, index) => (
-                    <tr key={row.id}>
-                      <td className="px-3 py-2 font-semibold">
-                        {row.status === "red" ? `P${index + 1}` : "Retake"}
-                      </td>
-                      <td className="px-3 py-2">
-                        <div className="font-semibold text-slate-900">{row.fcpId}</div>
-                        <div className="font-mono text-[10px] text-slate-500 truncate max-w-[180px]">
-                          {row.label}
-                        </div>
-                      </td>
-                      <td className="px-3 py-2">
-                        <StatusBadge status={row.status} label={row.classification} />
-                        <div className="text-[10px] text-slate-500 mt-1">
-                          {row.missingWaypoints} missing wp · {row.flaggedPhotos} flagged photo(s)
-                        </div>
-                      </td>
-                      <td className="px-3 py-2 text-slate-700">{row.action}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </section>
+          {issueRanking.length > 0 && <TopIssuesTable rows={issueRanking} />}
 
-          <section className="grid sm:grid-cols-3 gap-3 border-t border-slate-200 pt-5">
+          <ZoneActionSummary rows={zoneSummary} />
+
+          <CompliantZonesTable rows={zoneSummary.filter((z) => z.status === "green")} />
+
+          <section className="grid sm:grid-cols-4 gap-3 border-t border-slate-200 pt-5">
             <ReportStat
-              label="Accepted photos"
+              label="Compliant photos"
               value={photoSummary.compliant.toString()}
               color="#16a34a"
             />
             <ReportStat
-              label="Flagged photos"
-              value={photoSummary.flagged.toString()}
+              label="Needs review"
+              value={photoSummary.needsReview.toString()}
+              color="#d97706"
+            />
+            <ReportStat
+              label="Non-compliant"
+              value={photoSummary.nonCompliant.toString()}
               color="#dc2626"
             />
             <ReportStat
               label="Pending AI review"
               value={photoSummary.pending.toString()}
-              color="#d97706"
+              color="#475569"
             />
           </section>
         </div>
@@ -499,11 +538,121 @@ function segmentClassification(status: TrenchStatus): SegmentStatus {
   return "Missing Evidence";
 }
 
+// Per-FCP breakdown: rolls up trench statuses, photo class counts, and the
+// top 3 friendly issues mentioned by photos inside the zone. Length comes
+// straight from the geometry so the numbers tie back to the map snapshot.
+function buildZoneSummary(
+  site: ProjectData,
+  coverage: CoverageResult,
+  photos: ReportPhoto[],
+): ZoneSummaryRow[] {
+  const rows: ZoneSummaryRow[] = [];
+  for (const fcp of site.fcps) {
+    const trenches = site.trenchesByFcp[fcp.id] ?? [];
+    const trenchIds = new Set(trenches.map((t) => t.id));
+    let greenTrenches = 0;
+    let yellowTrenches = 0;
+    let redTrenches = 0;
+    let lengthM = 0;
+    for (const t of trenches) {
+      const status = coverage.trenchStatus[t.id] ?? "red";
+      if (status === "green") greenTrenches++;
+      else if (status === "yellow") yellowTrenches++;
+      else redTrenches++;
+      lengthM +=
+        t.lengthM ?? trenchLength(projectCoordsLngLat(t.geometry));
+    }
+
+    let compliantPhotos = 0;
+    let needsReviewPhotos = 0;
+    let nonCompliantPhotos = 0;
+    let pendingPhotos = 0;
+    let photoCount = 0;
+    const issueCounter = new Map<string, number>();
+    for (const photo of photos) {
+      if (photo.fcp_id !== fcp.id && !(photo.trench_id && trenchIds.has(photo.trench_id)))
+        continue;
+      photoCount++;
+      const verdict = photo.verdict;
+      if (verdict === "compliant") compliantPhotos++;
+      else if (verdict === "needs_review") needsReviewPhotos++;
+      else if (verdict === "non_compliant") nonCompliantPhotos++;
+      else if (photo.status === "pending") pendingPhotos++;
+      for (const raw of [...(photo.failed_checks ?? []), ...(photo.issues ?? [])]) {
+        const f = friendlyIssueLabel(raw);
+        if (!f) continue;
+        issueCounter.set(f.label, (issueCounter.get(f.label) ?? 0) + 1);
+      }
+    }
+
+    const photoGreenM = compliantPhotos * METERS_PER_PHOTO;
+    const photoYellowM = needsReviewPhotos * METERS_PER_PHOTO;
+    const denom = Math.max(lengthM, photoGreenM + photoYellowM, 1);
+    const greenM = Math.min(photoGreenM, denom);
+    const yellowM = Math.min(photoYellowM, denom - greenM);
+    const redM = Math.max(0, denom - greenM - yellowM);
+
+    const topIssues = Array.from(issueCounter.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([issue, count]) => ({ issue, count }));
+
+    rows.push({
+      fcpId: fcp.id,
+      label: fcp.name || fcp.id.slice(0, 8),
+      status: coverage.zoneStatus[fcp.id] ?? "red",
+      lengthM,
+      trenchCount: trenches.length,
+      greenTrenches,
+      yellowTrenches,
+      redTrenches,
+      photoCount,
+      compliantPhotos,
+      needsReviewPhotos,
+      nonCompliantPhotos,
+      pendingPhotos,
+      greenPct: (greenM / denom) * 100,
+      yellowPct: (yellowM / denom) * 100,
+      redPct: (redM / denom) * 100,
+      topIssues,
+    });
+  }
+  return rows.sort((a, b) => {
+    const rank = { red: 0, yellow: 1, green: 2 };
+    return rank[a.status] - rank[b.status] || b.lengthM - a.lengthM;
+  });
+}
+
+// Aggregate friendly issue labels across all photos. Used to surface
+// systemic problems (e.g. "Trench was not photographed from the side: 42").
+function aggregateIssues(photos: ReportPhoto[]): IssueAggregate[] {
+  const counts = new Map<string, { count: number; severity: "error" | "warning" | "info" }>();
+  for (const photo of photos) {
+    const seen = new Set<string>();
+    for (const raw of [...(photo.failed_checks ?? []), ...(photo.issues ?? [])]) {
+      const f = friendlyIssueLabel(raw);
+      if (!f) continue;
+      if (seen.has(f.label)) continue;
+      seen.add(f.label);
+      const existing = counts.get(f.label);
+      counts.set(f.label, {
+        count: (existing?.count ?? 0) + 1,
+        severity: existing?.severity ?? f.severity,
+      });
+    }
+  }
+  return Array.from(counts.entries())
+    .map(([issue, { count, severity }]) => ({ issue, count, severity }))
+    .sort((a, b) => b.count - a.count);
+}
+
 function summarizePhotos(photos: ReportPhoto[]) {
   return {
-    compliant: photos.filter((photo) => photo.status === "compliant").length,
-    flagged: photos.filter((photo) => photo.status === "flagged").length,
-    pending: photos.filter((photo) => photo.status === "pending").length,
+    compliant: photos.filter((p) => p.verdict === "compliant").length,
+    needsReview: photos.filter((p) => p.verdict === "needs_review").length,
+    nonCompliant: photos.filter((p) => p.verdict === "non_compliant").length,
+    flagged: photos.filter((p) => p.status === "flagged").length,
+    pending: photos.filter((p) => p.status === "pending").length,
   };
 }
 
@@ -660,56 +809,6 @@ function StatusPanel({
   );
 }
 
-function DeficiencyTable({
-  title,
-  empty,
-  rows,
-  icon,
-}: {
-  title: string;
-  empty: string;
-  rows: SegmentRow[];
-  icon: React.ReactNode;
-}) {
-  return (
-    <section className="rounded-lg border border-slate-200 overflow-hidden">
-      <div className="px-4 py-3 border-b border-slate-200 flex items-center gap-2">
-        {icon}
-        <h2 className="text-sm font-bold uppercase tracking-wide">{title}</h2>
-      </div>
-      {rows.length === 0 ? (
-        <div className="p-4 text-sm text-slate-500">{empty}</div>
-      ) : (
-        <div className="divide-y divide-slate-100">
-          {rows.map((row) => (
-            <div key={row.id} className="p-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-sm font-semibold truncate">{row.label}</div>
-                  <div className="text-[10px] font-mono text-slate-500 truncate">{row.id}</div>
-                </div>
-                <StatusBadge status={row.status} label={row.classification} />
-              </div>
-              <div className="grid grid-cols-3 gap-2 mt-2 text-[10px] text-slate-600">
-                <span>FCP {row.fcpId}</span>
-                <span>{row.lengthM.toFixed(0)} m</span>
-                <span>
-                  {row.coveredWaypoints}/{row.totalWaypoints} wp
-                </span>
-              </div>
-              {row.issues.length > 0 && (
-                <div className="text-[10px] text-slate-500 mt-2">
-                  Issues: {row.issues.join(", ")}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
 function StatusBadge({ status, label }: { status: TrenchStatus; label: SegmentStatus }) {
   const color = statusColor(status);
   return (
@@ -728,5 +827,275 @@ function LegendItem({ color, label }: { color: string; label: string }) {
       <span className="w-2 h-2 rounded-full" style={{ backgroundColor: color }} />
       {label}
     </span>
+  );
+}
+
+// Per-zone rollup table. Two views per row: the trench-status breakdown
+// (good/review/missing trenches) and the photo-class breakdown so the
+// reader can spot zones that are "covered but not yet accepted" vs zones
+// that simply have no evidence.
+function ZoneBreakdownTable({ rows }: { rows: ZoneSummaryRow[] }) {
+  if (rows.length === 0) return null;
+  return (
+    <section className="rounded-lg border border-slate-200 overflow-hidden">
+      <div className="px-4 py-3 border-b border-slate-200 flex items-center gap-2">
+        <MapPinned className="w-4 h-4 text-slate-600" />
+        <h2 className="text-sm font-bold uppercase tracking-wide">Zone Breakdown</h2>
+        <span className="ml-auto text-[10px] uppercase tracking-wider text-slate-500">
+          {rows.length} zone{rows.length === 1 ? "" : "s"}
+        </span>
+      </div>
+      <table className="w-full text-xs">
+        <thead className="bg-slate-50 text-slate-500 uppercase tracking-wide">
+          <tr>
+            <th className="text-left font-semibold px-3 py-2">Zone</th>
+            <th className="text-left font-semibold px-3 py-2">Status</th>
+            <th className="text-right font-semibold px-3 py-2">Length</th>
+            <th className="text-right font-semibold px-3 py-2">Trenches</th>
+            <th className="text-right font-semibold px-3 py-2">Photos</th>
+            <th className="text-left font-semibold px-3 py-2">Coverage by length</th>
+            <th className="text-left font-semibold px-3 py-2">Top issues</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {rows.map((row) => (
+            <tr key={row.fcpId}>
+              <td className="px-3 py-2">
+                <div className="font-semibold text-slate-900">{row.label}</div>
+                <div className="font-mono text-[10px] text-slate-500 truncate max-w-[140px]">
+                  {row.fcpId}
+                </div>
+              </td>
+              <td className="px-3 py-2">
+                <StatusBadge status={row.status} label={segmentClassification(row.status)} />
+              </td>
+              <td className="px-3 py-2 text-right font-mono">
+                {(row.lengthM / 1000).toFixed(2)} km
+              </td>
+              <td className="px-3 py-2 text-right">
+                <span className="text-emerald-700 font-bold">{row.greenTrenches}</span>
+                <span className="text-slate-400 mx-1">/</span>
+                <span className="text-amber-700 font-bold">{row.yellowTrenches}</span>
+                <span className="text-slate-400 mx-1">/</span>
+                <span className="text-red-700 font-bold">{row.redTrenches}</span>
+                <div className="text-[10px] text-slate-500">
+                  of {row.trenchCount}
+                </div>
+              </td>
+              <td className="px-3 py-2 text-right">
+                <div className="font-mono">{row.photoCount}</div>
+                <div className="text-[10px] text-slate-500">
+                  {row.compliantPhotos} ok · {row.needsReviewPhotos} rev · {row.nonCompliantPhotos} fail
+                </div>
+              </td>
+              <td className="px-3 py-2 min-w-[160px]">
+                <CoverageBar
+                  greenPct={row.greenPct}
+                  yellowPct={row.yellowPct}
+                  redPct={row.redPct}
+                />
+                <div className="text-[10px] text-slate-500 mt-1">
+                  {row.greenPct.toFixed(0)}% / {row.yellowPct.toFixed(0)}% / {row.redPct.toFixed(0)}%
+                </div>
+              </td>
+              <td className="px-3 py-2 text-[11px] text-slate-700 max-w-[260px]">
+                {row.topIssues.length === 0 ? (
+                  <span className="text-slate-400">—</span>
+                ) : (
+                  <ul className="space-y-0.5">
+                    {row.topIssues.map((i) => (
+                      <li key={i.issue} className="truncate">
+                        <span className="font-mono text-slate-500">{i.count}×</span> {i.issue}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+function CoverageBar({
+  greenPct,
+  yellowPct,
+  redPct,
+}: {
+  greenPct: number;
+  yellowPct: number;
+  redPct: number;
+}) {
+  return (
+    <div className="h-2 w-full rounded-full overflow-hidden bg-slate-100 flex">
+      {greenPct > 0 && <div className="h-full bg-emerald-500" style={{ width: `${greenPct}%` }} />}
+      {yellowPct > 0 && <div className="h-full bg-amber-500" style={{ width: `${yellowPct}%` }} />}
+      {redPct > 0 && <div className="h-full bg-red-500" style={{ width: `${redPct}%` }} />}
+    </div>
+  );
+}
+
+// Top friendly issues across the entire dataset, so a contractor can see
+// "X% of photos miss the side view" at a glance.
+function TopIssuesTable({ rows }: { rows: IssueAggregate[] }) {
+  return (
+    <section className="rounded-lg border border-slate-200 overflow-hidden">
+      <div className="px-4 py-3 border-b border-slate-200 flex items-center gap-2">
+        <AlertTriangle className="w-4 h-4 text-amber-600" />
+        <h2 className="text-sm font-bold uppercase tracking-wide">Most Common Issues</h2>
+        <span className="ml-auto text-[10px] uppercase tracking-wider text-slate-500">
+          top {rows.length}
+        </span>
+      </div>
+      <table className="w-full text-xs">
+        <thead className="bg-slate-50 text-slate-500 uppercase tracking-wide">
+          <tr>
+            <th className="text-left font-semibold px-3 py-2">#</th>
+            <th className="text-left font-semibold px-3 py-2">Issue</th>
+            <th className="text-right font-semibold px-3 py-2">Photos affected</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {rows.map((row, idx) => (
+            <tr key={row.issue}>
+              <td className="px-3 py-2 font-mono text-slate-400">{idx + 1}</td>
+              <td className="px-3 py-2 text-slate-800">{row.issue}</td>
+              <td className="px-3 py-2 text-right font-mono font-bold text-slate-900">
+                {row.count}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+// Zone-level contractor action summary. One row per zone needing work, with
+// rolled-up counts (how many trenches missing / under review, how many
+// flagged photos, etc.) and a single guidance line — no per-trench drilldown.
+function ZoneActionSummary({ rows }: { rows: ZoneSummaryRow[] }) {
+  const actionable = rows
+    .filter((z) => z.status !== "green")
+    .sort((a, b) => {
+      const rank = { red: 0, yellow: 1, green: 2 };
+      return rank[a.status] - rank[b.status] || b.redTrenches - a.redTrenches;
+    });
+  return (
+    <section className="rounded-lg border border-slate-200 overflow-hidden">
+      <div className="px-4 py-3 border-b border-slate-200 flex items-center gap-2">
+        <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+        <h2 className="text-sm font-bold uppercase tracking-wide">Contractor Action List</h2>
+        <span className="ml-auto text-[10px] uppercase tracking-wider text-slate-500">
+          {actionable.length === 0
+            ? "no actions"
+            : `${actionable.length} zone${actionable.length === 1 ? "" : "s"} need work`}
+        </span>
+      </div>
+      {actionable.length === 0 ? (
+        <div className="p-4 text-sm text-slate-500">No contractor actions remain open.</div>
+      ) : (
+        <table className="w-full text-xs">
+          <thead className="bg-slate-50 text-slate-500 uppercase tracking-wide">
+            <tr>
+              <th className="text-left font-semibold px-3 py-2">Zone</th>
+              <th className="text-left font-semibold px-3 py-2">Status</th>
+              <th className="text-right font-semibold px-3 py-2">Trenches</th>
+              <th className="text-left font-semibold px-3 py-2">Required action</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {actionable.map((zone) => (
+              <tr key={zone.fcpId}>
+                <td className="px-3 py-2">
+                  <div className="font-semibold text-slate-900">{zone.label}</div>
+                  <div className="text-[10px] text-slate-500">
+                    {(zone.lengthM / 1000).toFixed(2)} km · {zone.photoCount} photo(s)
+                  </div>
+                </td>
+                <td className="px-3 py-2">
+                  <StatusBadge status={zone.status} label={segmentClassification(zone.status)} />
+                </td>
+                <td className="px-3 py-2 text-right">
+                  {zone.redTrenches > 0 && (
+                    <span className="text-red-700 font-bold mr-2">{zone.redTrenches} missing</span>
+                  )}
+                  {zone.yellowTrenches > 0 && (
+                    <span className="text-amber-700 font-bold">{zone.yellowTrenches} review</span>
+                  )}
+                  <div className="text-[10px] text-slate-500">of {zone.trenchCount}</div>
+                </td>
+                <td className="px-3 py-2 text-slate-700">{zoneAction(zone)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}
+
+function zoneAction(zone: ZoneSummaryRow): string {
+  const parts: string[] = [];
+  if (zone.redTrenches > 0)
+    parts.push(
+      `submit GPS-tagged evidence for ${zone.redTrenches} undocumented trench${zone.redTrenches === 1 ? "" : "es"}`,
+    );
+  if (zone.nonCompliantPhotos > 0)
+    parts.push(
+      `retake ${zone.nonCompliantPhotos} non-compliant photo${zone.nonCompliantPhotos === 1 ? "" : "s"}`,
+    );
+  if (zone.needsReviewPhotos > 0)
+    parts.push(
+      `review ${zone.needsReviewPhotos} flagged photo${zone.needsReviewPhotos === 1 ? "" : "s"}`,
+    );
+  if (parts.length === 0) return "Awaiting evidence.";
+  // Capitalize first letter, end with full stop.
+  const sentence = parts.join("; ");
+  return sentence.charAt(0).toUpperCase() + sentence.slice(1) + ".";
+}
+
+// Zone-level positive evidence. Lists only zones that already passed in full.
+function CompliantZonesTable({ rows }: { rows: ZoneSummaryRow[] }) {
+  return (
+    <section className="rounded-lg border border-emerald-200 overflow-hidden">
+      <div className="px-4 py-3 border-b border-emerald-200 bg-emerald-50/50 flex items-center gap-2">
+        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+        <h2 className="text-sm font-bold uppercase tracking-wide">Compliant Zones</h2>
+        {rows.length > 0 && (
+          <span className="ml-auto text-[10px] uppercase tracking-wider text-emerald-700">
+            {rows.length} zone{rows.length === 1 ? "" : "s"}
+          </span>
+        )}
+      </div>
+      {rows.length === 0 ? (
+        <div className="p-4 text-sm text-slate-500">No fully compliant zones yet.</div>
+      ) : (
+        <table className="w-full text-xs">
+          <thead className="bg-slate-50 text-slate-500 uppercase tracking-wide">
+            <tr>
+              <th className="text-left font-semibold px-3 py-2">Zone</th>
+              <th className="text-right font-semibold px-3 py-2">Length</th>
+              <th className="text-right font-semibold px-3 py-2">Trenches</th>
+              <th className="text-right font-semibold px-3 py-2">Photos</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {rows.map((zone) => (
+              <tr key={zone.fcpId}>
+                <td className="px-3 py-2 font-semibold text-slate-900">{zone.label}</td>
+                <td className="px-3 py-2 text-right font-mono">
+                  {(zone.lengthM / 1000).toFixed(2)} km
+                </td>
+                <td className="px-3 py-2 text-right font-mono">{zone.trenchCount}</td>
+                <td className="px-3 py-2 text-right font-mono">{zone.compliantPhotos}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
   );
 }
