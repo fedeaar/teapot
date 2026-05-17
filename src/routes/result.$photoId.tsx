@@ -13,20 +13,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { CheckCircle2, XCircle, Loader2, ArrowLeft, RotateCcw, Ruler, Maximize2, MapPin, Copy, Calendar } from "lucide-react";
 import { motion } from "framer-motion";
+import { PhotoChecklist } from "@/components/site/PhotoChecklist";
 
 export const Route = createFileRoute("/result/$photoId")({
   component: ResultPage,
 });
-
-const CHECK_LABELS: Record<string, string> = {
-  DEPTH_TOO_SHALLOW: "Depth below 60 cm",
-  RULER_MISSING: "No measuring ruler visible",
-  BEDDING_MISSING: "Sand bedding not visible",
-  DUCT_NOT_VISIBLE: "Duct bundle not visible",
-  PIPE_ENDS_CUT_OFF: "Pipe ends out of frame",
-  OBSTRUCTED: "View obstructed",
-  LENGTH_UNCLEAR: "Length cannot be estimated",
-};
 
 type Analysis = {
   depth_cm: number | null;
@@ -431,42 +422,11 @@ function ResultPage() {
             </div>
           </div>
 
-          {(photo.failed_checks?.length ?? 0) > 0 && (
-            <div className="card-elevated p-4 space-y-2 border-danger/30">
-              <p className="text-xs uppercase text-muted-foreground tracking-wide">Issues</p>
-              {(photo.failed_checks as string[]).map((c, i) => (
-                <motion.div
-                  key={c + i}
-                  initial={{ x: -10, opacity: 0 }}
-                  animate={{ x: 0, opacity: 1 }}
-                  transition={{ delay: i * 0.05 }}
-                  className="flex items-center gap-2 text-sm"
-                >
-                  <XCircle className="w-4 h-4 text-danger shrink-0" />
-                  {CHECK_LABELS[c] ?? c}
-                </motion.div>
-              ))}
-              {photo.recommendation && (
-                <p className="text-xs text-warning mt-2 pt-2 border-t border-border">
-                  💡 {photo.recommendation}
-                </p>
-              )}
-            </div>
-          )}
-
-          {(photo.passed_checks ?? []).filter((c: string) => !c.startsWith("M:")).length > 0 && (
-            <div className="card-elevated p-4 space-y-2">
-              <p className="text-xs uppercase text-muted-foreground tracking-wide">Passed</p>
-              {(photo.passed_checks as string[])
-                .filter((c) => !c.startsWith("M:"))
-                .map((c, i) => (
-                  <div key={c + i} className="flex items-center gap-2 text-sm">
-                    <CheckCircle2 className="w-4 h-4 text-success shrink-0" />
-                    {CHECK_LABELS[c] ?? c.replace(/_OK$/, "").toLowerCase()}
-                  </div>
-                ))}
-            </div>
-          )}
+          <PhotoChecklist
+            failedChecks={(photo.failed_checks as string[] | null) ?? (photo.issues as string[] | null)}
+            passedChecks={photo.passed_checks as string[] | null}
+            recommendation={photo.recommendation}
+          />
 
           {isCompliant ? (
             <Button

@@ -6,6 +6,7 @@ import { loadProjectData, type ProjectData } from "@/lib/project-data";
 import { computeCoverage, photoClass, type CoverageResult, type PhotoLite } from "@/lib/coverage";
 import { METERS_PER_PHOTO } from "@/lib/validate-photo.functions";
 import { trenchLength, pointsAlongTrench } from "@/lib/geo";
+import { PhotoChecklist } from "@/components/site/PhotoChecklist";
 import { supabase } from "@/integrations/supabase/client";
 import { GeoJsonImporter } from "@/components/site/GeoJsonImporter";
 import { PhotoImporter } from "@/components/site/PhotoImporter";
@@ -60,6 +61,8 @@ export type MapPhoto = {
   duct_bundle_visible: boolean | null;
   unobstructed: boolean | null;
   issues: string[] | null;
+  failed_checks: string[] | null;
+  passed_checks: string[] | null;
   recommendation: string | null;
   captured_at: string | null;
   analyzed_at: string | null;
@@ -164,7 +167,7 @@ function ProjectDetailPage() {
     const { data } = await supabase
       .from("images")
       .select(
-        "id,fcp_id,status,latitude,longitude,trench_id,image_url,compliance_score,depth_cm,depth_pass,ruler_visible,bedding_visible,duct_bundle_visible,unobstructed,issues,recommendation,captured_at,verdict,analyzed_at,filename,cluster_id,project_id,waypoint_index",
+        "id,fcp_id,status,latitude,longitude,trench_id,image_url,compliance_score,depth_cm,depth_pass,ruler_visible,bedding_visible,duct_bundle_visible,unobstructed,issues,failed_checks,passed_checks,recommendation,captured_at,verdict,analyzed_at,filename,cluster_id,project_id,waypoint_index",
       )
       .eq("project_id", projectId);
     if (!data) return;
@@ -192,7 +195,7 @@ function ProjectDetailPage() {
           trench_id: d.trench_id,
           image_url: d.image_url,
           fcp_id: d.fcp_id,
-          waypoint_index: null,
+          waypoint_index: d.waypoint_index as number | null,
           compliance_score: d.compliance_score as number | null,
           depth_cm: d.depth_cm as number | null,
           depth_pass: d.depth_pass,
@@ -201,6 +204,8 @@ function ProjectDetailPage() {
           duct_bundle_visible: d.duct_bundle_visible,
           unobstructed: d.unobstructed,
           issues: (d.issues as string[] | null) ?? null,
+          failed_checks: (d.failed_checks as string[] | null) ?? null,
+          passed_checks: (d.passed_checks as string[] | null) ?? null,
           recommendation: d.recommendation,
           captured_at: d.captured_at,
           analyzed_at: d.analyzed_at,
@@ -677,6 +682,7 @@ type ZonePhoto = {
   status: string;
   verdict: string | null;
   trench_id: string | null;
+  waypoint_index: number | null;
   captured_at: string;
   compliance_score: number | null;
 };
@@ -717,7 +723,7 @@ function ZoneDetail({
     void (async () => {
       const { data } = await supabase
         .from("images")
-        .select("id,image_url,status,verdict,trench_id,captured_at,compliance_score")
+        .select("id,image_url,status,verdict,trench_id,waypoint_index,captured_at,compliance_score")
         .eq("fcp_id", fcpId)
         .order("captured_at", { ascending: false });
       setZonePhotos((data as ZonePhoto[]) ?? []);
@@ -810,34 +816,71 @@ function ZoneDetail({
         </div>
       </div>
 
-      {selectedTrench && waypoints.length > 0 && (
-        <div className="rounded-xl bg-background border border-border p-3">
-          <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-2 flex items-center justify-between">
-            <span>5m waypoints · {selectedTrench.name || selectedTrench.id.slice(0, 8)}</span>
-            <span className="font-mono normal-case tracking-normal">{waypoints.length}</span>
+      {selectedTrench && waypoints.length > 0 && (() => {
+        // Build a map of waypoint_index → best photoClass at that point so the
+        // sidebar grid mirrors the map dots: green/yellow/red where photos
+        // exist, gray for waypoints still needing a photo.
+        const wpClass: Record<number, "green" | "yellow" | "red"> = {};
+        const rank = (c: "green" | "yellow" | "red" | null) =>
+          c === "green" ? 3 : c === "yellow" ? 2 : c === "red" ? 1 : 0;
+        for (const p of zonePhotos) {
+          if (p.trench_id !== selectedTrenchId) continue;
+          const idx = p.waypoint_index;
+          if (idx == null) continue;
+          const cls = photoClass({
+            verdict: p.verdict ?? null,
+            status: p.status ?? null,
+            fcp_id: null,
+          });
+          if (!cls) continue;
+          const existing = wpClass[idx] ?? null;
+          if (rank(cls) > rank(existing)) wpClass[idx] = cls;
+        }
+        const withPhoto = Object.keys(wpClass).length;
+        return (
+          <div className="rounded-xl bg-background border border-border p-3">
+            <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-2 flex items-center justify-between">
+              <span>Waypoints · {selectedTrench.name || selectedTrench.id.slice(0, 8)}</span>
+              <span className="font-mono normal-case tracking-normal">
+                {withPhoto}/{waypoints.length}
+              </span>
+            </div>
+            <div className="grid grid-cols-5 gap-1 max-h-40 overflow-y-auto">
+              {waypoints.map((_, idx) => {
+                const isSel = selectedWaypointIndex === idx;
+                const cls = wpClass[idx];
+                const base =
+                  cls === "green"
+                    ? "bg-emerald-500/25 border-emerald-500 text-emerald-200"
+                    : cls === "yellow"
+                      ? "bg-amber-500/25 border-amber-500 text-amber-200"
+                      : cls === "red"
+                        ? "bg-red-600/25 border-red-600 text-red-200"
+                        : "bg-surface border-border text-muted-foreground";
+                return (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => onWaypointSelect(isSel ? null : idx)}
+                    className={`text-[10px] font-mono px-1.5 py-1 rounded-md border transition-colors ${
+                      isSel ? "ring-2 ring-amber-400 bg-amber-400 text-black border-amber-400" : base
+                    } hover:border-primary/60`}
+                    title={`Waypoint ${idx + 1} · ${idx * 5}m · ${cls ?? "no photo"}`}
+                  >
+                    {idx * 5}m
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mt-2 flex gap-3 text-[10px] text-muted-foreground">
+              <Legend color="bg-emerald-500" label="compliant" />
+              <Legend color="bg-amber-500" label="needs review" />
+              <Legend color="bg-red-600" label="non-compliant" />
+              <Legend color="bg-surface border border-border" label="missing" />
+            </div>
           </div>
-          <div className="grid grid-cols-5 gap-1 max-h-40 overflow-y-auto">
-            {waypoints.map((_, idx) => {
-              const isSel = selectedWaypointIndex === idx;
-              return (
-                <button
-                  key={idx}
-                  type="button"
-                  onClick={() => onWaypointSelect(isSel ? null : idx)}
-                  className={`text-[10px] font-mono px-1.5 py-1 rounded-md border transition-colors ${
-                    isSel
-                      ? "bg-amber-400 text-black border-amber-400"
-                      : "bg-surface border-border hover:border-primary/60"
-                  }`}
-                  title={`Waypoint ${idx + 1} · ${idx * 5}m`}
-                >
-                  {idx * 5}m
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
+        );
+      })()}
 
       <div className="rounded-xl bg-background border border-border p-3">
         <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-2 flex items-center justify-between">
@@ -873,14 +916,18 @@ function ZoneDetail({
           return (
             <div className="grid grid-cols-3 gap-1.5 max-h-56 overflow-y-auto">
               {list.map((p) => {
+                const cls = photoClass({
+                  verdict: p.verdict ?? null,
+                  status: p.status ?? null,
+                  fcp_id: null,
+                });
                 const ringColor =
-                  p.verdict === "compliant"
+                  cls === "green"
                     ? "ring-success"
-                    : p.verdict === "flagged"
-                      ? "ring-danger"
-                      : p.status === "analyzed" &&
-                          (p.verdict === "non_compliant" || p.verdict === "needs_review")
-                        ? "ring-warning"
+                    : cls === "yellow"
+                      ? "ring-warning"
+                      : cls === "red"
+                        ? "ring-danger"
                         : "ring-muted-foreground/40";
                 return (
                   <Link
@@ -917,6 +964,15 @@ function ZoneDetail({
 
 // --- Stat ---
 
+function Legend({ color, label }: { color: string; label: string }) {
+  return (
+    <span className="flex items-center gap-1">
+      <span className={`w-2 h-2 rounded-sm ${color}`} />
+      <span>{label}</span>
+    </span>
+  );
+}
+
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg bg-background border border-border p-2 text-center">
@@ -938,16 +994,6 @@ function MapLoading() {
 
 // --- Photo Detail Panel ---
 
-const CHECK_LABELS: Record<string, string> = {
-  DEPTH_TOO_SHALLOW: "Depth below required minimum",
-  RULER_MISSING: "No measuring ruler visible",
-  BEDDING_MISSING: "Sand bedding not visible",
-  DUCT_NOT_VISIBLE: "Duct bundle not visible",
-  PIPE_ENDS_CUT_OFF: "Pipe ends out of frame",
-  OBSTRUCTED: "View obstructed",
-  LENGTH_UNCLEAR: "Length cannot be estimated",
-};
-
 function PhotoDetailPanel({ photo, onClose }: { photo: MapPhoto | null; onClose: () => void }) {
   if (!photo) return null;
 
@@ -956,7 +1002,6 @@ function PhotoDetailPanel({ photo, onClose }: { photo: MapPhoto | null; onClose:
   const isFlagged = photo.verdict === "flagged";
   const score = photo.compliance_score ?? 0;
   const minDepth = 60;
-  const issues = photo.issues ?? [];
   const hasAnalysis = photo.compliance_score != null;
 
   return (
@@ -1042,25 +1087,11 @@ function PhotoDetailPanel({ photo, onClose }: { photo: MapPhoto | null; onClose:
             </div>
           )}
 
-          {issues.length > 0 && (
-            <div className="rounded-lg border border-danger/30 bg-danger/5 p-2.5 space-y-1">
-              <div className="text-[10px] uppercase tracking-wider text-danger font-semibold">
-                Issues
-              </div>
-              {issues.map((c, i) => (
-                <div key={c + i} className="text-xs flex items-center gap-1.5">
-                  <X className="w-3 h-3 text-danger shrink-0" />
-                  {CHECK_LABELS[c] ?? c}
-                </div>
-              ))}
-            </div>
-          )}
-
-          {photo.recommendation && (
-            <div className="rounded-lg border border-warning/30 bg-warning/5 p-2.5 text-xs">
-              {photo.recommendation}
-            </div>
-          )}
+          <PhotoChecklist
+            failedChecks={photo.failed_checks ?? photo.issues}
+            passedChecks={photo.passed_checks}
+            recommendation={photo.recommendation}
+          />
 
           {!hasAnalysis && (
             <div className="text-xs text-muted-foreground text-center py-2">

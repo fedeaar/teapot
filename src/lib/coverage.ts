@@ -9,7 +9,7 @@ export type PhotoLite = {
   fcp_id: string | null;
   trench_id?: string | null;
   waypoint_index?: number | null;
-  status: string | null; // 'compliant' | 'flagged' | 'pending' | 'irrelevant'
+  status: string | null; // 'compliant' | 'needs_review' | 'flagged' | 'pending' | 'irrelevant'
   verdict?: string | null; // 'green' | 'yellow' | 'red' (legacy: 'compliant' | 'non_compliant' | 'needs_review')
 };
 
@@ -26,8 +26,9 @@ export function photoClass(photo: PhotoLite): TrenchStatus | null {
   if (v === "red" || v === "non_compliant") return "red";
   // Fall back to status for rows that never got a verdict.
   if (photo.status === "compliant") return "green";
-  if (photo.status === "irrelevant") return "red";
+  if (photo.status === "needs_review") return "yellow";
   if (photo.status === "flagged") return "yellow";
+  if (photo.status === "irrelevant") return "red";
   return null;
 }
 
@@ -83,6 +84,22 @@ function photoIsFlagged(photo: PhotoLite): boolean {
   return c === "red" || c === "yellow";
 }
 
+function majorityClass(photos: PhotoLite[]): TrenchStatus {
+  let g = 0;
+  let y = 0;
+  let r = 0;
+  for (const p of photos) {
+    const c = photoClass(p);
+    if (c === "green") g++;
+    else if (c === "yellow") y++;
+    else if (c === "red") r++;
+  }
+  if (g === 0 && y === 0 && r === 0) return "red";
+  if (r >= y && r >= g) return "red";
+  if (y >= g) return "yellow";
+  return "green";
+}
+
 function statusFromEvidence(args: {
   needed: number;
   compliant: number;
@@ -116,6 +133,15 @@ export function computeCoverage(site: CoverageSite, photos: PhotoLite[]): Covera
     const list = photosByTrench.get(p.trench_id) ?? [];
     list.push(p);
     photosByTrench.set(p.trench_id, list);
+  }
+
+  // Photos grouped by zone for majority-class coloring on the overall map.
+  const photosByZone = new Map<string, PhotoLite[]>();
+  for (const p of photos) {
+    if (!p.fcp_id) continue;
+    const list = photosByZone.get(p.fcp_id) ?? [];
+    list.push(p);
+    photosByZone.set(p.fcp_id, list);
   }
 
   const zoneStats: CoverageResult["zoneStats"] = {};
@@ -168,15 +194,12 @@ export function computeCoverage(site: CoverageSite, photos: PhotoLite[]): Covera
       addLength(zoneTotals, status, lengthM);
     }
 
-    const zoneM = zoneTotals.greenM + zoneTotals.yellowM + zoneTotals.redM;
     const ratio = needed === 0 ? 0 : compliant / needed;
     zoneStats[fcp.id] = { needed, compliant, flagged, ratio };
-    zoneStatus[fcp.id] =
-      zoneM > 0 && zoneTotals.greenM === zoneM
-        ? "green"
-        : zoneTotals.yellowM > 0 || zoneTotals.greenM > 0
-          ? "yellow"
-          : "red";
+    // Overall-view coloring: pick the class with the most photos in the zone.
+    // Tie-break favours the worse class (red > yellow > green) so a 1-1 tie
+    // surfaces the more cautious read. Empty zones stay red.
+    zoneStatus[fcp.id] = majorityClass(photosByZone.get(fcp.id) ?? []);
   }
 
   // Trenches not assigned to any FCP zone are still classified by their own
@@ -257,6 +280,62 @@ export function computeCoverage(site: CoverageSite, photos: PhotoLite[]): Covera
       redPct: pct(photoRedM),
     },
   };
+}
+
+// Build the colored sub-segments of a trench polyline based on photo coverage.
+// Each photo with a waypoint_index paints a HALO_M-half halo (so 10 m total
+// centered on the waypoint). Overlapping halos resolve in favour of the
+// higher (more compliant) class: green > yellow > red. Stretches of the
+// trench with no photo halo are omitted — the caller renders an uncolored
+// base under these segments.
+export function trenchColoredSegments(
+  geometryLatLng: [number, number][],
+  photos: Array<{ waypoint_index: number | null; class: TrenchStatus }>,
+  options: { halfHaloM?: number; sampleSpacingM?: number; waypointSpacingM?: number } = {},
+): Array<{ coords: [number, number][]; cls: TrenchStatus }> {
+  const HALO = options.halfHaloM ?? 5;
+  const SAMPLE = options.sampleSpacingM ?? 1;
+  const WP = options.waypointSpacingM ?? 5;
+  if (geometryLatLng.length < 2 || photos.length === 0) return [];
+
+  const lngLat = geometryLatLng.map(
+    ([lat, lng]) => [lng, lat] as [number, number],
+  );
+  const samples = pointsAlongTrench(lngLat, SAMPLE);
+  if (samples.length === 0) return [];
+
+  // Higher value = more compliant; ties keep first-set value (no swap).
+  const rank: Record<TrenchStatus, number> = { red: 1, yellow: 2, green: 3 };
+  const sampleClass: (TrenchStatus | null)[] = new Array(samples.length).fill(null);
+
+  for (const p of photos) {
+    if (p.waypoint_index == null) continue;
+    const photoM = p.waypoint_index * WP;
+    const lo = Math.max(0, Math.floor((photoM - HALO) / SAMPLE));
+    const hi = Math.min(samples.length - 1, Math.ceil((photoM + HALO) / SAMPLE));
+    for (let i = lo; i <= hi; i++) {
+      const cur = sampleClass[i];
+      if (!cur || rank[p.class] > rank[cur]) sampleClass[i] = p.class;
+    }
+  }
+
+  const out: Array<{ coords: [number, number][]; cls: TrenchStatus }> = [];
+  let i = 0;
+  while (i < samples.length) {
+    const cls = sampleClass[i];
+    if (!cls) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < samples.length && sampleClass[j] === cls) j++;
+    const coords = samples
+      .slice(i, j)
+      .map((s) => [s.lat, s.lng] as [number, number]);
+    if (coords.length >= 2) out.push({ coords, cls });
+    i = j;
+  }
+  return out;
 }
 
 export function statusColor(s: TrenchStatus): string {

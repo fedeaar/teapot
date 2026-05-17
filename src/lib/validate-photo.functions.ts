@@ -208,8 +208,8 @@ export const validatePhoto = createServerFn({ method: "POST" })
     const content = payload.choices?.[0]?.message?.content ?? "";
     const parsed = ResultSchema.parse(extractJson(content));
     // Three-class classification is the source of truth. Legacy callers
-    // still read `compliant` — it now mirrors classification == "green".
-    const compliant = parsed.classification === "green";
+    // still read `compliant` — it now mirrors classification == "compliant".
+    const compliant = parsed.classification === VERDICT_COMPLIANT;
     return {
       ...parsed,
       compliant,

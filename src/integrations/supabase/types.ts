@@ -129,6 +129,7 @@ export type Database = {
           issues: string[] | null
           latitude: number | null
           longitude: number | null
+          original_filename: string | null
           passed_checks: string[] | null
           project_id: string | null
           recommendation: string | null
@@ -163,6 +164,7 @@ export type Database = {
           issues?: string[] | null
           latitude?: number | null
           longitude?: number | null
+          original_filename?: string | null
           passed_checks?: string[] | null
           project_id?: string | null
           recommendation?: string | null
@@ -197,6 +199,7 @@ export type Database = {
           issues?: string[] | null
           latitude?: number | null
           longitude?: number | null
+          original_filename?: string | null
           passed_checks?: string[] | null
           project_id?: string | null
           recommendation?: string | null

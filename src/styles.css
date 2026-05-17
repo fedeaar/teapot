@@ -121,3 +121,17 @@
 .leaflet-tile { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9); }
 .leaflet-control-attribution { background: rgba(0,0,0,0.6) !important; color: #888 !important; }
 .leaflet-control-attribution a { color: #aaa !important; }
+
+/* Photo-hover tooltip — match the app's surface/border tokens so it reads
+   like one of the sidebar cards rather than Leaflet's default white box. */
+.leaflet-tooltip.photo-tooltip {
+  background: var(--surface) !important;
+  color: var(--foreground) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 12px !important;
+  padding: 6px !important;
+  box-shadow: 0 6px 24px -4px rgb(0 0 0 / 0.6) !important;
+  font-family: inherit !important;
+  white-space: normal !important;
+}
+.leaflet-tooltip.photo-tooltip::before { display: none !important; }

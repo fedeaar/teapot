@@ -52,6 +52,9 @@ export function UploadedPhotosSection({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [reevaluating, setReevaluating] = useState(false);
   const [reevalProgress, setReevalProgress] = useState({ done: 0, total: 0 });
+  const PAGE_SIZE = 60;
+  const [page, setPage] = useState(0);
+  const [totalCount, setTotalCount] = useState(0);
   const navigate = useNavigate();
   const validate = useServerFn(validatePhoto);
 
@@ -72,20 +75,34 @@ export function UploadedPhotosSection({
 
   const load = useCallback(async () => {
     setLoading(true);
-    const { data, error } = await supabase
+    const from = page * PAGE_SIZE;
+    const to = from + PAGE_SIZE - 1;
+    const { data, error, count } = await supabase
       .from("images")
       .select(
         "id,image_url,latitude,longitude,captured_at,created_at,fcp_id,trench_id,status,verdict,issues",
+        { count: "exact" },
       )
       .order("created_at", { ascending: false })
-      .limit(200);
-    if (!error) setPhotos((data ?? []) as PhotoRow[]);
+      .range(from, to);
+    if (!error) {
+      setPhotos((data ?? []) as PhotoRow[]);
+      if (typeof count === "number") setTotalCount(count);
+    }
     setLoading(false);
-  }, []);
+  }, [page]);
 
   useEffect(() => {
     load();
   }, [load, refreshKey]);
+
+  // External refresh (after import / re-eval) should land back on the first
+  // page so the freshest rows are visible.
+  useEffect(() => {
+    setPage(0);
+  }, [refreshKey]);
+
+  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
 
   const handleDelete = useCallback(
     async (photo: PhotoRow) => {
@@ -350,7 +367,7 @@ export function UploadedPhotosSection({
           <p className="text-sm text-muted-foreground">
             {photos === null
               ? "Loading…"
-              : `${photos.length} photo${photos.length === 1 ? "" : "s"} on record`}
+              : `${totalCount} photo${totalCount === 1 ? "" : "s"} on record`}
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap justify-end">
@@ -405,6 +422,40 @@ export function UploadedPhotosSection({
           </Button>
         </div>
       </div>
+
+      {totalCount > 0 && (
+        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+          <div>
+            Showing <span className="font-mono text-foreground">{page * PAGE_SIZE + 1}</span>
+            –
+            <span className="font-mono text-foreground">
+              {Math.min((page + 1) * PAGE_SIZE, totalCount)}
+            </span>{" "}
+            of <span className="font-mono text-foreground">{totalCount}</span>
+          </div>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={page === 0 || loading}
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+            >
+              Prev
+            </Button>
+            <span className="px-2 font-mono">
+              {page + 1} / {totalPages}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={page + 1 >= totalPages || loading}
+              onClick={() => setPage((p) => p + 1)}
+            >
+              Next
+            </Button>
+          </div>
+        </div>
+      )}
 
       {photos === null ? (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">

@@ -31,7 +31,7 @@ import {
   type Verdict,
 } from "@/lib/validate-photo.functions";
 import { siteDataToProjectData } from "@/lib/site-adapter";
-import { sealPhoto } from "@/lib/seal";
+import { sealPhoto, hashImageBytes, hashedFilename } from "@/lib/seal";
 import { CoverageReport } from "@/components/site/CoverageReport";
 import { ocrGpsFromImage } from "@/lib/ocr-gps.functions";
 import { geocodeAddress } from "@/lib/geocode.functions";
@@ -114,11 +114,6 @@ async function imageDimensions(file: File): Promise<{ width: number; height: num
   }
 }
 
-function fileExtension(name: string): string {
-  const m = name.match(/\.([a-zA-Z0-9]+)$/);
-  return m ? m[1].toLowerCase() : "jpg";
-}
-
 function fallbackCapturedAt(file: File, exifIso: string | null): string {
   if (exifIso) return exifIso;
   if (file.lastModified) return new Date(file.lastModified).toISOString();
@@ -161,18 +156,27 @@ function fileToDataUrl(file: File): Promise<string> {
 }
 
 // Map AI analysis + match status onto the photos.status enum
-// ("compliant" | "flagged" | "pending" | "irrelevant") used elsewhere in the app.
+// ("compliant" | "needs_review" | "flagged" | "pending" | "irrelevant") used
+// elsewhere in the app. `status` is the row-level *intake* flag — it stays
+// "flagged" only when the photo failed an integrity check (off-site, no GPS,
+// AI-generated). A needs_review verdict is not an intake failure: the photo
+// is on-site and analyzable, the analyst just has to look at it. Non-compliant
+// verdicts also surface as "flagged" because they're a visible failure.
 function deriveStatus(
   matchStatus: "pending" | "flagged",
   analysis: PhotoAnalysis | null,
   flag: PhotoFlag | null,
   ai: AiDetectionResult | null,
-): "compliant" | "flagged" | "pending" | "irrelevant" {
+): "compliant" | "needs_review" | "flagged" | "pending" | "irrelevant" {
   if (isIrrelevant(flag)) return "irrelevant";
   if (ai && ai.is_ai_generated && ai.confidence >= 0.5) return "flagged";
   if (matchStatus === "flagged") return "flagged";
   if (!analysis) return "pending";
-  return analysis.compliant ? "compliant" : "flagged";
+  const cls = verdictFromAny((analysis as any)?.classification);
+  if (cls === VERDICT_COMPLIANT) return "compliant";
+  if (cls === VERDICT_NEEDS_REVIEW) return "needs_review";
+  if (cls === VERDICT_NON_COMPLIANT) return "flagged";
+  return analysis.compliant ? "compliant" : "needs_review";
 }
 
 function isIrrelevant(flag: PhotoFlag | null): boolean {
@@ -314,6 +318,22 @@ export function PhotoImporter({
 
       for (const it of newItems) {
         void (async () => {
+          // Step 0: hash the raw bytes and dedup against the DB before any
+          // expensive work (EXIF, OCR, geocode, blur, Gemini). EXIF GPS lives
+          // inside the JPEG bytes, so different-location uploads of "the same
+          // photo" already produce different hashes — no metadata salt needed.
+          const earlyBytes = await it.file.arrayBuffer();
+          const precomputedHash = await hashImageBytes(earlyBytes);
+          const { data: existingHashRow } = await supabase
+            .from("images")
+            .select("sha256")
+            .eq("sha256", precomputedHash)
+            .maybeSingle();
+          if (existingHashRow) {
+            updateItem(it.key, { state: { kind: "duplicate" } });
+            return;
+          }
+
           let lat: number | null = null;
           let lng: number | null = null;
           let exifCapturedAt: string | null = null;
@@ -418,8 +438,11 @@ export function PhotoImporter({
           if (blurResult.faceCount > 0) {
             match.issues = [...match.issues, `faces_blurred:${blurResult.faceCount}`];
           }
-          const bytes = await workingFile.arrayBuffer();
-          const { sha256, sealId } = await sealPhoto(bytes, lat, lng, capturedAt);
+          // Reuse the precomputed hash so the stored sha256 matches the value
+          // we used for early dedup. Blur changes the bytes, but the hash is
+          // a content-identity key over the *input* file, not the stored one.
+          const sha256 = precomputedHash;
+          const sealId = `SP-${new Date(capturedAt).getFullYear()}-${sha256.slice(0, 10).toUpperCase()}`;
           updateItem(it.key, {
             state: {
               kind: "ready",
@@ -525,11 +548,13 @@ export function PhotoImporter({
       const { sha256, sealId } = await sealPhoto(bytes, 0, 0, capturedAt);
 
       const dims = await imageDimensions(workingFile);
-      const ext = fileExtension(workingFile.name);
-      const filename = `${crypto.randomUUID()}.${ext}`;
+      const filename = hashedFilename(sha256, workingFile.name);
       const { error: upErr } = await supabase.storage
         .from("photos")
-        .upload(filename, workingFile, { contentType: workingFile.type || "image/jpeg" });
+        .upload(filename, workingFile, {
+          contentType: workingFile.type || "image/jpeg",
+          upsert: true,
+        });
       if (upErr) throw upErr;
       const { data: pub } = supabase.storage.from("photos").getPublicUrl(filename);
 
@@ -540,6 +565,7 @@ export function PhotoImporter({
         .from("images")
         .insert({
           filename,
+          original_filename: it.file.name,
           image_url: pub.publicUrl,
           captured_at: capturedAt,
           project_id: activeProjectId,
@@ -589,11 +615,13 @@ export function PhotoImporter({
 
     try {
       const dims = await imageDimensions(file);
-      const ext = fileExtension(file.name);
-      const filename = `${crypto.randomUUID()}.${ext}`;
+      const filename = hashedFilename(sha256, file.name);
       const { error: upErr } = await supabase.storage
         .from("photos")
-        .upload(filename, file, { contentType: file.type || "image/jpeg" });
+        .upload(filename, file, {
+          contentType: file.type || "image/jpeg",
+          upsert: true,
+        });
       if (upErr) throw upErr;
       const { data: pub } = supabase.storage.from("photos").getPublicUrl(filename);
 
@@ -686,6 +714,7 @@ export function PhotoImporter({
         .from("images")
         .insert({
           filename,
+          original_filename: file.name,
           image_url: pub.publicUrl,
           latitude: storedLat,
           longitude: storedLng,

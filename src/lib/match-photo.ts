@@ -8,7 +8,7 @@ import type { ProjectData, ProjectTrench } from "./project-data";
 // Waypoints are placed every 5 m along each trench.
 export const WAYPOINT_SPACING_M = 5;
 // Photos must be within 0.5 m of a waypoint to count as a clean match.
-export const WAYPOINT_OK_M = 0.5;
+export const WAYPOINT_OK_M = 5;
 // Anything past 15 m from the nearest trench is off-site.
 export const WAYPOINT_FLAG_M = 15;
 
